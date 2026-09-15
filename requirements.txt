@@ -1,0 +1,12 @@
+torch
+torchvision
+numpy
+Pillow
+pytorch-msssim
+tensorboard
+tqdm
+matplotlib
+nbformat
+nbclient
+ipykernel
+scipy
