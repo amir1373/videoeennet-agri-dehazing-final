@@ -71,10 +71,20 @@ def main() -> None:
     parser.add_argument("--seq-len", type=int, default=10); parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=2); parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=2e-4); parser.add_argument("--weight-decay", type=float, default=1e-4)
+    # Augmentation: the original run had only a fixed 0.9x crop, and showed a 5.5 dB
+    # val->test gap (26.28 -> 20.76), i.e. it memorised training scenes.
+    parser.add_argument("--augment", action="store_true", help="scene-generalisation augmentation")
+    parser.add_argument("--aug-scale-min", type=float, default=0.6)
+    parser.add_argument("--aug-hflip", type=float, default=0.5)
+    parser.add_argument("--aug-treverse", type=float, default=0.25)
+    # Gamma jitter OFF by default. It is applied identically to hazy and clean so it is
+    # SAFE, but REVIDE is a narrow indoor-lighting domain so colour-balance robustness is
+    # not the failure mode here - and bundling it would confound attribution of the gain.
+    parser.add_argument("--aug-gamma", type=float, default=0.0)
     parser.add_argument("--base-channels", type=int, default=32); parser.add_argument("--hidden-dim", type=int, default=64, help="Use the same value for every ablation.")
     parser.add_argument("--temporal-mode", choices=["convlstm", "spatial_transformer", "hybrid"], default="convlstm")
     parser.add_argument("--attention-heads", type=int, default=4); parser.add_argument("--attention-pool-size", type=int, default=8)
-    parser.add_argument("--num-workers", type=int, default=4); parser.add_argument("--save-every", type=int, default=1)
+    parser.add_argument("--num-workers", type=int, default=4); parser.add_argument("--prefetch-factor", type=int, default=2); parser.add_argument("--preprocess", type=str, default="resize", choices=["resize", "crop"]); parser.add_argument("--save-every", type=int, default=1)
     parser.add_argument("--max-val-batches", type=int, default=0, help="0 evaluates all validation windows.")
     parser.add_argument("--resume", default="auto", help="'auto', an explicit .pt path, or empty string to start fresh.")
     parser.add_argument("--no-amp", action="store_true"); parser.add_argument("--seed", type=int, default=1234)
@@ -88,13 +98,15 @@ def main() -> None:
         raise RuntimeError('CUDA is unavailable; select a GPU pod and a CUDA-enabled PyTorch environment')
     output = Path(args.output_dir); checkpoint_dir, log_dir = output / "checkpoints", output / "logs"; checkpoint_dir.mkdir(parents=True, exist_ok=True)
     auto_val = args.val_split == 'auto'
-    train_set = REVIDEVideoDataset(args.data_root, args.train_split, args.seq_len, args.image_size, random_crop=True, partition='train' if auto_val else None, split_seed=args.split_seed)
-    val_set = REVIDEVideoDataset(args.data_root, args.train_split if auto_val else args.val_split, args.seq_len, args.image_size, random_crop=False, partition='val' if auto_val else None, split_seed=args.split_seed)
+    train_set = REVIDEVideoDataset(args.data_root, args.train_split, args.seq_len, args.image_size, random_crop=True, partition='train' if auto_val else None, split_seed=args.split_seed, augment=args.augment, aug_scale_min=args.aug_scale_min, aug_hflip=args.aug_hflip, aug_treverse=args.aug_treverse, aug_gamma=args.aug_gamma, preprocess=args.preprocess)
+    val_set = REVIDEVideoDataset(args.data_root, args.train_split if auto_val else args.val_split, args.seq_len, args.image_size, random_crop=False, partition='val' if auto_val else None, split_seed=args.split_seed, preprocess=args.preprocess)
     train_paths = {str(p.resolve()) for s in train_set.sequences for pair in s['pairs'] for p in pair}
     val_paths = {str(p.resolve()) for s in val_set.sequences for pair in s['pairs'] for p in pair}
     if train_paths & val_paths:
         raise ValueError('Training and validation files overlap')
     loader_options = {"num_workers": args.num_workers, "pin_memory": device.type == "cuda", "persistent_workers": args.num_workers > 0}
+    if args.num_workers > 0:
+        loader_options["prefetch_factor"] = args.prefetch_factor
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, drop_last=True, **loader_options)
     val_loader = DataLoader(val_set, batch_size=1, shuffle=False, **loader_options)
     if not len(train_loader): raise RuntimeError("Training set is smaller than batch size; lower --batch-size.")

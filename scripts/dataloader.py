@@ -55,14 +55,46 @@ def discover_sequences(root: str | Path, split: Optional[str] = None) -> List[Di
                         key = (str(hazy_seq.resolve()), str(clean_seq.resolve()))
                         if pairs and key not in seen: seen.add(key); sequences.append({"name": hazy_seq.name, "pairs": pairs})
     return sorted(sequences, key=lambda s: (s['name'], str(s['pairs'][0][0].relative_to(root))))
-def _load_rgb(path: Path, image_size: int) -> torch.Tensor:
-    array = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32) / 255.0
+# Crop origin is fixed once per CLIP, never per frame: every frame in a window must share the
+# same spatial window, otherwise the temporal model sees a moving viewport instead of a moving
+# scene and the ConvLSTM is asked to model camera motion that is not there.
+_CROP_ORIGIN = {"top": None, "left": None, "random": False}
+
+
+def _crop_origin(H: int, W: int, crop: int):
+    if _CROP_ORIGIN["top"] is not None:
+        return _CROP_ORIGIN["top"], _CROP_ORIGIN["left"]
+    if _CROP_ORIGIN["random"]:
+        return random.randint(0, max(0, H - crop)), random.randint(0, max(0, W - crop))
+    return (H - crop) // 2, (W - crop) // 2
+
+
+def _load_rgb(path: Path, image_size: int, preprocess: str = "resize") -> torch.Tensor:
+    """preprocess="resize": squash the whole frame to image_size^2 (original behaviour).
+       preprocess="crop"  : take an image_size^2 crop at NATIVE resolution, which is what TRDN
+                            does. REVIDE frames are 2708x1800, so resizing is a ~10x downscale
+                            that averages away sensor noise and fine haze structure - measured
+                            to be worth 2.67 dB, so the two models were never solving the same
+                            task. Train crops are random (spatial diversity), eval crops centre
+                            (matching TRDN's random_crop=False)."""
+    img = Image.open(path).convert("RGB")
+    if preprocess == "crop":
+        W, H = img.size
+        crop = min(image_size, H, W)
+        top, left = _crop_origin(H, W, crop)
+        img = img.crop((left, top, left + crop, top + crop))
+        return torch.from_numpy(np.asarray(img, dtype=np.float32) / 255.0).permute(2, 0, 1)
+    array = np.asarray(img, dtype=np.float32) / 255.0
     return F.interpolate(torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0), size=(image_size, image_size), mode="bilinear", align_corners=False)[0]
 
 class REVIDEVideoDataset(Dataset):
     """Returns `frames` [T, 3, H, W] plus the clean final frame target."""
-    def __init__(self, root: str, split: Optional[str], seq_len: int = 10, image_size: int = 256, random_crop: bool = False, partition: Optional[str] = None, split_seed: int = 1234) -> None:
+    def __init__(self, root: str, split: Optional[str], seq_len: int = 10, image_size: int = 256, random_crop: bool = False, partition: Optional[str] = None, split_seed: int = 1234, augment: bool = False, aug_scale_min: float = 0.6, aug_hflip: float = 0.5, aug_treverse: float = 0.25, aug_gamma: float = 0.3, preprocess: str = "resize") -> None:
         self.root, self.split, self.seq_len, self.image_size, self.random_crop = Path(root), split, seq_len, image_size, random_crop
+        self.preprocess = preprocess
+        # Augmentation for scene generalisation. Val/test construct with augment=False.
+        self.augment, self.aug_scale_min = augment, aug_scale_min
+        self.aug_hflip, self.aug_treverse, self.aug_gamma = aug_hflip, aug_treverse, aug_gamma
         self.sequences = discover_sequences(self.root, split); self.index: List[Tuple[int, int]] = []
         if partition is not None:
             if partition not in {'train', 'val'}:
@@ -79,8 +111,47 @@ class REVIDEVideoDataset(Dataset):
     def __getitem__(self, index: int) -> Dict[str, object]:
         sequence_index, end_index = self.index[index]; sequence = self.sequences[sequence_index]; pairs: Sequence[Tuple[Path, Path]] = sequence["pairs"]
         clip = pairs[end_index - self.seq_len + 1 : end_index + 1]
-        hazy, clean = torch.stack([_load_rgb(path, self.image_size) for path, _ in clip]), torch.stack([_load_rgb(path, self.image_size) for _, path in clip])
-        if self.random_crop and self.image_size >= 64:
+        if self.preprocess == "crop":
+            # one origin for the whole clip; random while training, centre otherwise
+            _CROP_ORIGIN["random"] = bool(self.augment or self.random_crop)
+            _CROP_ORIGIN["top"] = _CROP_ORIGIN["left"] = None
+            with Image.open(clip[0][0]) as _probe:
+                _W, _H = _probe.size
+            _c = min(self.image_size, _H, _W)
+            _CROP_ORIGIN["top"], _CROP_ORIGIN["left"] = _crop_origin(_H, _W, _c)
+        hazy = torch.stack([_load_rgb(path, self.image_size, self.preprocess) for path, _ in clip])
+        clean = torch.stack([_load_rgb(path, self.image_size, self.preprocess) for _, path in clip])
+        _CROP_ORIGIN["top"] = _CROP_ORIGIN["left"] = None
+        if self.augment and self.image_size >= 64:
+            # --- variable-scale random crop (was a fixed 0.9x, giving almost no spatial diversity)
+            scale = random.uniform(self.aug_scale_min, 1.0)
+            crop = max(32, int(self.image_size * scale))
+            top = random.randint(0, self.image_size - crop)
+            left = random.randint(0, self.image_size - crop)
+            hazy = hazy[:, :, top:top + crop, left:left + crop]
+            clean = clean[:, :, top:top + crop, left:left + crop]
+            hazy = F.interpolate(hazy, size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
+            clean = F.interpolate(clean, size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
+
+            # --- horizontal flip. Identical transform on hazy AND clean, or the pairing breaks.
+            #     NO vertical flip: haze density varies with depth/height (sky above, ground below),
+            #     so flipping vertically produces physically impossible haze gradients.
+            if random.random() < self.aug_hflip:
+                hazy, clean = torch.flip(hazy, dims=[3]), torch.flip(clean, dims=[3])
+
+            # --- temporal reversal: the clip played backwards is still plausible motion, and the
+            #     target stays clean[-1] so the task is unchanged. Gives the ConvLSTM new dynamics.
+            if random.random() < self.aug_treverse:
+                hazy, clean = torch.flip(hazy, dims=[0]), torch.flip(clean, dims=[0])
+
+            # --- gamma jitter, applied IDENTICALLY to hazy and clean so the transmission
+            #     relationship between them is preserved. Kept mild: haze/atmospheric-light
+            #     estimation depends on absolute colour statistics, so heavy colour jitter
+            #     would teach the model a physically wrong prior.
+            if random.random() < self.aug_gamma:
+                g = random.uniform(0.85, 1.18)
+                hazy, clean = hazy.clamp(0, 1).pow(g), clean.clamp(0, 1).pow(g)
+        elif self.random_crop and self.image_size >= 64:
             crop = int(self.image_size * 0.9); top, left = random.randint(0, self.image_size-crop), random.randint(0, self.image_size-crop)
             hazy = F.interpolate(hazy[:, :, top:top+crop, left:left+crop], size=(self.image_size, self.image_size), mode="bilinear", align_corners=False); clean = F.interpolate(clean[:, :, top:top+crop, left:left+crop], size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
         return {"frames": hazy, "target": clean[-1], "clean_frames": clean, "sequence_name": str(sequence["name"]), "frame_path": str(clip[-1][0])}
