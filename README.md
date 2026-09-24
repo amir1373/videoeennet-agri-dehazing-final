@@ -5,7 +5,7 @@ post-training figures, follow [RUNPOD.md](RUNPOD.md) and
 [the RunPod notebook](notebooks/VideoEENet_RunPod.ipynb). Use `--val-split auto`
 and `--require-cuda --report-after-training` for the complete workflow.
 
-VideoEENet dehazes the current video frame using a chronological window of the current frame plus its previous nine hazy frames. It retains the intended EENet frequency/spatial feature processing and adds ConvLSTM temporal memory before reconstruction.
+VideoEENet dehazes the current video frame using a chronological window of the current frame plus its previous nine hazy frames. Its per-frame encoder is a simplified version of EENet's frequency/spatial dual-domain design, taken from the author's own EENet implementation ([amir1373/EENet-Dehazing](https://github.com/amir1373/EENet-Dehazing)), and it adds ConvLSTM temporal memory before reconstruction.
 
 ## Architecture
 
@@ -104,6 +104,14 @@ Equal hidden dimensions control recurrent width, not total model parameter count
 - This is a supervised temporal dehazing model, not a diffusion model.
 - Validation is against the clean final frame in each REVIDE window.
 - No training results are claimed until you run this pipeline on your data.
+
+## References
+
+VideoEENet builds on:
+
+- Y. Cui, Q. Wang, C. Li, W. Ren, and A. Knoll, "EENet: An effective and efficient network for single image dehazing," *Pattern Recognition*, vol. 158, art. no. 111074, 2025, doi: [10.1016/j.patcog.2024.111074](https://doi.org/10.1016/j.patcog.2024.111074). Official code: [github.com/c-yn/EENet](https://github.com/c-yn/EENet).
+- X. Shi, Z. Chen, H. Wang, D.-Y. Yeung, W.-K. Wong, and W.-C. Woo, "Convolutional LSTM network: A machine learning approach for precipitation nowcasting," in *Proc. NeurIPS*, 2015, pp. 802–810.
+- X. Zhang et al., "Learning to restore hazy video: A new real-world dataset and a new method," in *Proc. IEEE/CVF CVPR*, 2021, pp. 9239–9248 (the REVIDE dataset).
 
 ## Citation
 
