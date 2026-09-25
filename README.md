@@ -116,3 +116,15 @@ VideoEENet builds on:
 ## Citation
 
 Citation placeholder: add the final paper citation once the manuscript is ready.
+
+## Matched-protocol options (branch `retrain-2026-09`)
+
+- The model now builds only the modules its `--temporal-mode` uses: the default `convlstm` model
+  has 1,805,443 parameters, all trained. `load_model_state()` still reads older checkpoints.
+- `--temporal-mode single_frame`: the identical network given only the final frame of each window
+  (no temporal information), for testing whether temporal information helps.
+- `--aug-vflip P`: vertical flip with probability P (default 0).
+- `--val-group scene`: validation holds out whole training scenes instead of 10-frame chunks of
+  training videos.
+- `scripts/analysis/matched_eval.py` scores under the crop protocol with TRDN's exact metrics
+  (scikit-image SSIM on uint8, LPIPS-Alex) and records per-window PSNR.
