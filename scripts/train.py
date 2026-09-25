@@ -81,8 +81,10 @@ def main() -> None:
     # SAFE, but REVIDE is a narrow indoor-lighting domain so colour-balance robustness is
     # not the failure mode here - and bundling it would confound attribution of the gain.
     parser.add_argument("--aug-gamma", type=float, default=0.0)
+    parser.add_argument("--aug-vflip", type=float, default=0.0, help="vertical-flip probability (0 = off, the original setting)")
+    parser.add_argument("--val-group", choices=["sequence", "scene"], default="sequence", help="scene holds out whole training scenes for validation")
     parser.add_argument("--base-channels", type=int, default=32); parser.add_argument("--hidden-dim", type=int, default=64, help="Use the same value for every ablation.")
-    parser.add_argument("--temporal-mode", choices=["convlstm", "spatial_transformer", "hybrid"], default="convlstm")
+    parser.add_argument("--temporal-mode", choices=["convlstm", "spatial_transformer", "hybrid", "single_frame"], default="convlstm")
     parser.add_argument("--attention-heads", type=int, default=4); parser.add_argument("--attention-pool-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4); parser.add_argument("--prefetch-factor", type=int, default=2); parser.add_argument("--preprocess", type=str, default="resize", choices=["resize", "crop"]); parser.add_argument("--save-every", type=int, default=1)
     parser.add_argument("--max-val-batches", type=int, default=0, help="0 evaluates all validation windows.")
@@ -98,8 +100,8 @@ def main() -> None:
         raise RuntimeError('CUDA is unavailable; select a GPU pod and a CUDA-enabled PyTorch environment')
     output = Path(args.output_dir); checkpoint_dir, log_dir = output / "checkpoints", output / "logs"; checkpoint_dir.mkdir(parents=True, exist_ok=True)
     auto_val = args.val_split == 'auto'
-    train_set = REVIDEVideoDataset(args.data_root, args.train_split, args.seq_len, args.image_size, random_crop=True, partition='train' if auto_val else None, split_seed=args.split_seed, augment=args.augment, aug_scale_min=args.aug_scale_min, aug_hflip=args.aug_hflip, aug_treverse=args.aug_treverse, aug_gamma=args.aug_gamma, preprocess=args.preprocess)
-    val_set = REVIDEVideoDataset(args.data_root, args.train_split if auto_val else args.val_split, args.seq_len, args.image_size, random_crop=False, partition='val' if auto_val else None, split_seed=args.split_seed, preprocess=args.preprocess)
+    train_set = REVIDEVideoDataset(args.data_root, args.train_split, args.seq_len, args.image_size, random_crop=True, partition='train' if auto_val else None, split_seed=args.split_seed, augment=args.augment, aug_scale_min=args.aug_scale_min, aug_hflip=args.aug_hflip, aug_treverse=args.aug_treverse, aug_gamma=args.aug_gamma, preprocess=args.preprocess, aug_vflip=args.aug_vflip, val_group=args.val_group)
+    val_set = REVIDEVideoDataset(args.data_root, args.train_split if auto_val else args.val_split, args.seq_len, args.image_size, random_crop=False, partition='val' if auto_val else None, split_seed=args.split_seed, preprocess=args.preprocess, val_group=args.val_group)
     train_paths = {str(p.resolve()) for s in train_set.sequences for pair in s['pairs'] for p in pair}
     val_paths = {str(p.resolve()) for s in val_set.sequences for pair in s['pairs'] for p in pair}
     if train_paths & val_paths:
@@ -117,13 +119,14 @@ def main() -> None:
     resume_path = resolve_resume(args.resume, checkpoint_dir)
     if resume_path:
         saved_config = torch.load(resume_path, map_location="cpu", weights_only=False)["config"]
-        for key in ("epochs", "seq_len", "hidden_dim", "base_channels", "temporal_mode", "image_size", "batch_size", "seed", "data_root", "train_split", "val_split", "split_seed", "attention_heads", "attention_pool_size"):
+        for key in ("epochs", "seq_len", "hidden_dim", "base_channels", "temporal_mode", "image_size", "batch_size", "seed", "data_root", "train_split", "val_split", "split_seed", "attention_heads", "attention_pool_size", "aug_vflip", "val_group", "augment"):
             if saved_config.get(key) != getattr(args, key):
                 raise ValueError(f"Resume configuration mismatch for {key}; use the original run configuration")
         checkpoint = torch.load(resume_path, map_location=device, weights_only=False); model.load_state_dict(checkpoint["model"]); optimizer.load_state_dict(checkpoint["optimizer"]); scheduler.load_state_dict(checkpoint["scheduler"]); scaler.load_state_dict(checkpoint.get("scaler", {})); start_epoch, step, best = int(checkpoint["epoch"]) + 1, int(checkpoint["step"]), checkpoint.get("best", best)
         print(f"Resumed from {resume_path} at epoch {start_epoch}, step {step}.")
     (output / "config.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
-    print(f"Device={device}, AMP={use_amp}, train_windows={len(train_set)}, val_windows={len(val_set)}")
+    print(f"Device={device}, AMP={use_amp}, train_windows={len(train_set)}, val_windows={len(val_set)}, val_group={args.val_group}, val_groups={getattr(val_set, 'val_groups', None)}")
+    print(f"Parameters: {sum(p.numel() for p in model.parameters()):,} (all used by temporal_mode={args.temporal_mode})")
     for epoch in range(start_epoch, args.epochs):
         model.train(); epoch_losses = []
         progress = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}")

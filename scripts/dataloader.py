@@ -89,22 +89,32 @@ def _load_rgb(path: Path, image_size: int, preprocess: str = "resize") -> torch.
 
 class REVIDEVideoDataset(Dataset):
     """Returns `frames` [T, 3, H, W] plus the clean final frame target."""
-    def __init__(self, root: str, split: Optional[str], seq_len: int = 10, image_size: int = 256, random_crop: bool = False, partition: Optional[str] = None, split_seed: int = 1234, augment: bool = False, aug_scale_min: float = 0.6, aug_hflip: float = 0.5, aug_treverse: float = 0.25, aug_gamma: float = 0.3, preprocess: str = "resize") -> None:
+    def __init__(self, root: str, split: Optional[str], seq_len: int = 10, image_size: int = 256, random_crop: bool = False, partition: Optional[str] = None, split_seed: int = 1234, augment: bool = False, aug_scale_min: float = 0.6, aug_hflip: float = 0.5, aug_treverse: float = 0.25, aug_gamma: float = 0.3, preprocess: str = "resize", aug_vflip: float = 0.0, val_group: str = "sequence") -> None:
         self.root, self.split, self.seq_len, self.image_size, self.random_crop = Path(root), split, seq_len, image_size, random_crop
         self.preprocess = preprocess
         # Augmentation for scene generalisation. Val/test construct with augment=False.
         self.augment, self.aug_scale_min = augment, aug_scale_min
         self.aug_hflip, self.aug_treverse, self.aug_gamma = aug_hflip, aug_treverse, aug_gamma
+        self.aug_vflip = aug_vflip
         self.sequences = discover_sequences(self.root, split); self.index: List[Tuple[int, int]] = []
         if partition is not None:
             if partition not in {'train', 'val'}:
                 raise ValueError('partition must be train or val')
-            names = sorted({str(s['name']) for s in self.sequences})
+            # val_group="sequence" (original): hold out 10% of the 10-frame sequence folders. These
+            # are consecutive chunks of the same videos used for training, so validation frames
+            # are near-duplicates of training frames. val_group="scene": hold out whole scenes
+            # (the code before the first underscore, e.g. C002 covers C002_1..C002_4), so no
+            # validation scene is ever seen in training, as on the test set.
+            if val_group not in {'sequence', 'scene'}:
+                raise ValueError('val_group must be sequence or scene')
+            group_of = (lambda name: name.split('_')[0]) if val_group == 'scene' else (lambda name: name)
+            names = sorted({group_of(str(s['name'])) for s in self.sequences})
             if len(names) < 2:
-                raise ValueError('At least two training sequences are needed for a separate validation set')
+                raise ValueError('At least two training groups are needed for a separate validation set')
             ranked = sorted(names, key=lambda name: int.from_bytes(hashlib.sha256(f'{split_seed}:{name}'.encode()).digest()[:8], 'big'))
             val_names = set(ranked[:min(len(names) - 1, max(1, round(len(names) * 0.1)))])
-            self.sequences = [s for s in self.sequences if (s['name'] in val_names) == (partition == 'val')]
+            self.val_groups = sorted(val_names)
+            self.sequences = [s for s in self.sequences if (group_of(str(s['name'])) in val_names) == (partition == 'val')]
         for sequence_index, sequence in enumerate(self.sequences): self.index.extend((sequence_index, end) for end in range(seq_len - 1, len(sequence["pairs"])))
         if not self.index: raise FileNotFoundError(f"No paired {seq_len}-frame sequences under {self.root}. Expected paired hazy/gt or hazy/clean folders.")
     def __len__(self) -> int: return len(self.index)
@@ -134,10 +144,13 @@ class REVIDEVideoDataset(Dataset):
             clean = F.interpolate(clean, size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
 
             # --- horizontal flip. Identical transform on hazy AND clean, or the pairing breaks.
-            #     NO vertical flip: haze density varies with depth/height (sky above, ground below),
-            #     so flipping vertically produces physically impossible haze gradients.
             if random.random() < self.aug_hflip:
                 hazy, clean = torch.flip(hazy, dims=[3]), torch.flip(clean, dims=[3])
+            # --- vertical flip (off by default; tested as its own experiment). Real haze gets
+            #     denser with depth, which in these scenes often tracks image height, so a flipped
+            #     frame can show a haze gradient that does not occur in the test data.
+            if self.aug_vflip > 0 and random.random() < self.aug_vflip:
+                hazy, clean = torch.flip(hazy, dims=[2]), torch.flip(clean, dims=[2])
 
             # --- temporal reversal: the clip played backwards is still plausible motion, and the
             #     target stays clean[-1] so the task is unchanged. Gives the ConvLSTM new dynamics.

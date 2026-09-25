@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from PIL import Image
 from tqdm.auto import tqdm
-from model import VideoEENet
+from model import VideoEENet, load_model_state
 from dataloader import natural_key
 SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 def read_image(path: Path) -> torch.Tensor:
@@ -16,7 +16,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Dehaze a chronological folder of video frames.")
     parser.add_argument("--input-dir", required=True); parser.add_argument("--output-dir", required=True); parser.add_argument("--checkpoint", required=True); parser.add_argument("--seq-len", type=int, default=10); args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu"); checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False); config = checkpoint.get("config", {})
-    model = VideoEENet(int(config.get("base_channels", 32)), int(config.get("hidden_dim", 64)), config.get("temporal_mode", "convlstm"), int(config.get("attention_heads", 4)), int(config.get("attention_pool_size", 8)), args.seq_len).to(device); model.load_state_dict(checkpoint["model"]); model.eval()
+    model = VideoEENet(int(config.get("base_channels", 32)), int(config.get("hidden_dim", 64)), config.get("temporal_mode", "convlstm"), int(config.get("attention_heads", 4)), int(config.get("attention_pool_size", 8)), args.seq_len).to(device); load_model_state(model, checkpoint["model"]); model.eval()
     inputs = sorted((path for path in Path(args.input_dir).iterdir() if path.is_file() and path.suffix.lower() in SUFFIXES), key=natural_key)
     if not inputs: raise FileNotFoundError(f"No supported image frames in {args.input_dir}")
     output = Path(args.output_dir); output.mkdir(parents=True, exist_ok=True); history = []

@@ -16,7 +16,7 @@ import torch
 from tqdm.auto import tqdm
 
 from dataloader import REVIDEVideoDataset
-from model import VideoEENet
+from model import VideoEENet, load_model_state
 from train import psnr, ssim
 
 
@@ -46,7 +46,7 @@ def build_report(run_dir, data_root, test_split='Test', device_name=None):
         if dataset_paths & {str(p.resolve()) for s in used.sequences for pair in s['pairs'] for p in pair}:
             raise ValueError('Test files overlap training or validation files')
     model = VideoEENet(config['base_channels'], config['hidden_dim'], config['temporal_mode'], config['attention_heads'], config['attention_pool_size'], config['seq_len']).to(device).eval()
-    model.load_state_dict(checkpoint['model'])
+    load_model_state(model, checkpoint['model'])
     selected = set(np.linspace(0, len(dataset) - 1, min(4, len(dataset)), dtype=int).tolist())
     rows, samples, worst, animation = [], [], [], []
     previous = None

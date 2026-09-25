@@ -89,24 +89,38 @@ class SpatialTemporalTransformer(nn.Module):
         current = self.norm(tokens[:, -1]).reshape(batch, self.pool_size, self.pool_size, -1).permute(0, 3, 1, 2)
         return F.interpolate(current, size=(height, width), mode="bilinear", align_corners=False)
 
+TEMPORAL_MODES = ("convlstm", "spatial_transformer", "hybrid", "single_frame")
+
 class VideoEENet(nn.Module):
-    """Predict the clean final frame from a hazy sequence [B, T, 3, H, W]."""
+    """Predict the clean final frame from a hazy sequence [B, T, 3, H, W].
+
+    Only the modules the chosen temporal_mode uses are constructed, so every parameter of a
+    model is trained. "single_frame" is the no-temporal ablation: the identical network (same
+    encoder, ConvLSTM and decoder, same parameter count) is given only the final frame, so the
+    ConvLSTM runs for one step from a zero state and carries no temporal information.
+    """
     def __init__(self, base_channels: int = 32, hidden_dim: int = 64, temporal_mode: str = "convlstm", attention_heads: int = 4, attention_pool_size: int = 8, max_seq_len: int = 10) -> None:
         super().__init__()
-        if temporal_mode not in {"convlstm", "spatial_transformer", "hybrid"}: raise ValueError("temporal_mode must be convlstm, spatial_transformer, or hybrid")
+        if temporal_mode not in TEMPORAL_MODES: raise ValueError(f"temporal_mode must be one of {TEMPORAL_MODES}")
         self.temporal_mode = temporal_mode
-        self.encoder, self.temporal = EENetEncoder(base_channels=base_channels), ConvLSTM(base_channels * 4, hidden_dim)
-        self.attention = SpatialTemporalTransformer(base_channels * 4, hidden_dim, attention_heads, attention_pool_size, max_seq_len)
-        self.hybrid_fuse = nn.Conv2d(hidden_dim * 2, hidden_dim, 1)
+        self.encoder = EENetEncoder(base_channels=base_channels)
+        if temporal_mode in {"convlstm", "hybrid", "single_frame"}:
+            self.temporal = ConvLSTM(base_channels * 4, hidden_dim)
+        if temporal_mode in {"spatial_transformer", "hybrid"}:
+            self.attention = SpatialTemporalTransformer(base_channels * 4, hidden_dim, attention_heads, attention_pool_size, max_seq_len)
+        if temporal_mode == "hybrid":
+            self.hybrid_fuse = nn.Conv2d(hidden_dim * 2, hidden_dim, 1)
         self.decoder = nn.Sequential(nn.Conv2d(hidden_dim + base_channels * 4, base_channels * 4, 3, padding=1), nn.GELU(), nn.ConvTranspose2d(base_channels * 4, base_channels * 2, 4, stride=2, padding=1), nn.GELU(), nn.ConvTranspose2d(base_channels * 2, base_channels, 4, stride=2, padding=1), nn.GELU(), nn.Conv2d(base_channels, 3, 3, padding=1))
     def forward(self, frames: torch.Tensor) -> torch.Tensor:
         if frames.ndim != 5 or frames.shape[2] != 3: raise ValueError(f"Expected [B, T, 3, H, W], got {tuple(frames.shape)}")
+        if self.temporal_mode == "single_frame":
+            frames = frames[:, -1:]
         batch, steps, _, height, width = frames.shape
-        if steps < 2: raise ValueError("VideoEENet requires at least two temporal frames.")
+        if steps < 2 and self.temporal_mode != "single_frame": raise ValueError("VideoEENet requires at least two temporal frames.")
         pad_h, pad_w = (-height) % 4, (-width) % 4
         padded = F.pad(frames.reshape(-1, 3, height, width), (0, pad_w, 0, pad_h), mode="replicate")
         features = self.encoder(padded).reshape(batch, steps, -1, (height + pad_h) // 4, (width + pad_w) // 4)
-        if self.temporal_mode == "convlstm":
+        if self.temporal_mode in {"convlstm", "single_frame"}:
             memory = self.temporal(features)
         elif self.temporal_mode == "spatial_transformer":
             memory = self.attention(features)
@@ -116,8 +130,19 @@ class VideoEENet(nn.Module):
         current = padded.reshape(batch, steps, 3, height + pad_h, width + pad_w)[:, -1]
         return torch.sigmoid(residual + current)[:, :, :height, :width]
 
+def load_model_state(model: VideoEENet, state: dict) -> list[str]:
+    """Load a checkpoint, including ones saved before unused modules were removed.
+
+    Checkpoints from earlier versions also hold the never-used attention/hybrid_fuse weights of
+    a convlstm model; those keys are dropped (and returned) and everything else must match.
+    """
+    own = set(model.state_dict())
+    dropped = [key for key in state if key not in own and key.split(".")[0] in {"attention", "hybrid_fuse"}]
+    model.load_state_dict({key: value for key, value in state.items() if key not in dropped}, strict=True)
+    return dropped
+
 def shape_test() -> dict[str, tuple[int, ...]]:
     frames = torch.rand(1, 10, 3, 64, 64); results = {"frames": tuple(frames.shape)}
-    for mode in ("convlstm", "spatial_transformer", "hybrid"):
+    for mode in TEMPORAL_MODES:
         with torch.no_grad(): results[mode] = tuple(VideoEENet(base_channels=8, hidden_dim=16, temporal_mode=mode).eval()(frames).shape)
     return results
