@@ -90,6 +90,10 @@ class SpatialTemporalTransformer(nn.Module):
         return F.interpolate(current, size=(height, width), mode="bilinear", align_corners=False)
 
 TEMPORAL_MODES = ("convlstm", "spatial_transformer", "hybrid", "single_frame")
+# "sigmoid_sum": the original sigmoid(residual + current), which does NOT return the input when the
+#   residual is zero (it returns sigmoid(current)). "logit_residual": sigmoid(logit(current) +
+#   residual), which returns the input exactly when the residual is zero.
+OUTPUT_MODES = ("sigmoid_sum", "logit_residual")
 
 class VideoEENet(nn.Module):
     """Predict the clean final frame from a hazy sequence [B, T, 3, H, W].
@@ -99,11 +103,13 @@ class VideoEENet(nn.Module):
     encoder, ConvLSTM and decoder, same parameter count) is given only the final frame, so the
     ConvLSTM runs for one step from a zero state and carries no temporal information.
     """
-    def __init__(self, base_channels: int = 32, hidden_dim: int = 64, temporal_mode: str = "convlstm", attention_heads: int = 4, attention_pool_size: int = 8, max_seq_len: int = 10) -> None:
+    def __init__(self, base_channels: int = 32, hidden_dim: int = 64, temporal_mode: str = "convlstm", attention_heads: int = 4, attention_pool_size: int = 8, max_seq_len: int = 10, output_mode: str = "sigmoid_sum", in_channels: int = 3) -> None:
         super().__init__()
         if temporal_mode not in TEMPORAL_MODES: raise ValueError(f"temporal_mode must be one of {TEMPORAL_MODES}")
-        self.temporal_mode = temporal_mode
-        self.encoder = EENetEncoder(base_channels=base_channels)
+        if output_mode not in OUTPUT_MODES: raise ValueError(f"output_mode must be one of {OUTPUT_MODES}")
+        if in_channels not in (3, 4): raise ValueError("in_channels must be 3 (RGB) or 4 (RGB + occlusion mask)")
+        self.temporal_mode, self.output_mode, self.in_channels = temporal_mode, output_mode, in_channels
+        self.encoder = EENetEncoder(in_channels=in_channels, base_channels=base_channels)
         if temporal_mode in {"convlstm", "hybrid", "single_frame"}:
             self.temporal = ConvLSTM(base_channels * 4, hidden_dim)
         if temporal_mode in {"spatial_transformer", "hybrid"}:
@@ -112,13 +118,13 @@ class VideoEENet(nn.Module):
             self.hybrid_fuse = nn.Conv2d(hidden_dim * 2, hidden_dim, 1)
         self.decoder = nn.Sequential(nn.Conv2d(hidden_dim + base_channels * 4, base_channels * 4, 3, padding=1), nn.GELU(), nn.ConvTranspose2d(base_channels * 4, base_channels * 2, 4, stride=2, padding=1), nn.GELU(), nn.ConvTranspose2d(base_channels * 2, base_channels, 4, stride=2, padding=1), nn.GELU(), nn.Conv2d(base_channels, 3, 3, padding=1))
     def forward(self, frames: torch.Tensor) -> torch.Tensor:
-        if frames.ndim != 5 or frames.shape[2] != 3: raise ValueError(f"Expected [B, T, 3, H, W], got {tuple(frames.shape)}")
+        if frames.ndim != 5 or frames.shape[2] != self.in_channels: raise ValueError(f"Expected [B, T, {self.in_channels}, H, W], got {tuple(frames.shape)}")
         if self.temporal_mode == "single_frame":
             frames = frames[:, -1:]
         batch, steps, _, height, width = frames.shape
         if steps < 2 and self.temporal_mode != "single_frame": raise ValueError("VideoEENet requires at least two temporal frames.")
         pad_h, pad_w = (-height) % 4, (-width) % 4
-        padded = F.pad(frames.reshape(-1, 3, height, width), (0, pad_w, 0, pad_h), mode="replicate")
+        padded = F.pad(frames.reshape(-1, self.in_channels, height, width), (0, pad_w, 0, pad_h), mode="replicate")
         features = self.encoder(padded).reshape(batch, steps, -1, (height + pad_h) // 4, (width + pad_w) // 4)
         if self.temporal_mode in {"convlstm", "single_frame"}:
             memory = self.temporal(features)
@@ -127,7 +133,10 @@ class VideoEENet(nn.Module):
         else:
             memory = self.hybrid_fuse(torch.cat([self.temporal(features), self.attention(features)], dim=1))
         residual = self.decoder(torch.cat([memory, features[:, -1]], dim=1))
-        current = padded.reshape(batch, steps, 3, height + pad_h, width + pad_w)[:, -1]
+        current = padded.reshape(batch, steps, self.in_channels, height + pad_h, width + pad_w)[:, -1, :3]
+        if self.output_mode == "logit_residual":
+            current_logit = torch.logit(current.float().clamp(1e-4, 1 - 1e-4))
+            return torch.sigmoid(current_logit + residual.float())[:, :, :height, :width]
         return torch.sigmoid(residual + current)[:, :, :height, :width]
 
 def load_model_state(model: VideoEENet, state: dict) -> list[str]:
