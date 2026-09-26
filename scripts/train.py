@@ -133,6 +133,9 @@ def main() -> None:
     parser.add_argument("--occlusion", action="store_true", help="train on windows partly hidden by an opaque occluder; adds a mask input channel")
     parser.add_argument("--occlusion-coverage-min", type=float, default=0.05); parser.add_argument("--occlusion-coverage-max", type=float, default=0.65)
     parser.add_argument("--occlusion-scope", choices=["lens", "current", "mixed"], default="mixed")
+    parser.add_argument("--retrieval-index", default="", help="R1: retrieval index JSON (empty = preceding frames)")
+    parser.add_argument("--align", choices=["none", "raft"], default="none", help="V10: warp earlier frames to the current one with frozen RAFT before encoding")
+    parser.add_argument("--backbone", choices=["compact", "full"], default="compact", help="V11: 'full' = two dual-domain blocks per stage and multiscale skips from the current frame")
     args = parser.parse_args(); set_seed(args.seed)
     if min(args.epochs, args.batch_size, args.save_every, args.image_size) < 1 or args.seq_len < 2:
         parser.error("epochs, batch size, save interval and image size must be positive; seq-len must be >= 2")
@@ -143,8 +146,8 @@ def main() -> None:
         raise RuntimeError('CUDA is unavailable; select a GPU pod and a CUDA-enabled PyTorch environment')
     output = Path(args.output_dir); checkpoint_dir, log_dir = output / "checkpoints", output / "logs"; checkpoint_dir.mkdir(parents=True, exist_ok=True)
     auto_val = args.val_split == 'auto'
-    train_set = REVIDEVideoDataset(args.data_root, args.train_split, args.seq_len, args.image_size, random_crop=True, partition='train' if auto_val else None, split_seed=args.split_seed, augment=args.augment, aug_scale_min=args.aug_scale_min, aug_hflip=args.aug_hflip, aug_treverse=args.aug_treverse, aug_gamma=args.aug_gamma, preprocess=args.preprocess, aug_vflip=args.aug_vflip, val_group=args.val_group)
-    val_set = REVIDEVideoDataset(args.data_root, args.train_split if auto_val else args.val_split, args.seq_len, args.image_size, random_crop=False, partition='val' if auto_val else None, split_seed=args.split_seed, preprocess=args.preprocess, val_group=args.val_group)
+    train_set = REVIDEVideoDataset(args.data_root, args.train_split, args.seq_len, args.image_size, random_crop=True, partition='train' if auto_val else None, split_seed=args.split_seed, augment=args.augment, aug_scale_min=args.aug_scale_min, aug_hflip=args.aug_hflip, aug_treverse=args.aug_treverse, aug_gamma=args.aug_gamma, preprocess=args.preprocess, aug_vflip=args.aug_vflip, val_group=args.val_group, retrieval_index=args.retrieval_index or None)
+    val_set = REVIDEVideoDataset(args.data_root, args.train_split if auto_val else args.val_split, args.seq_len, args.image_size, random_crop=False, partition='val' if auto_val else None, split_seed=args.split_seed, preprocess=args.preprocess, val_group=args.val_group, retrieval_index=args.retrieval_index or None)
     train_paths = {str(p.resolve()) for s in train_set.sequences for pair in s['pairs'] for p in pair}
     val_paths = {str(p.resolve()) for s in val_set.sequences for pair in s['pairs'] for p in pair}
     if train_paths & val_paths:
@@ -155,7 +158,7 @@ def main() -> None:
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, drop_last=True, **loader_options)
     val_loader = DataLoader(val_set, batch_size=1, shuffle=False, **loader_options)
     if not len(train_loader): raise RuntimeError("Training set is smaller than batch size; lower --batch-size.")
-    model = VideoEENet(args.base_channels, args.hidden_dim, args.temporal_mode, args.attention_heads, args.attention_pool_size, args.seq_len, output_mode=args.output_mode, in_channels=4 if args.occlusion else 3).to(device)
+    model = VideoEENet(args.base_channels, args.hidden_dim, args.temporal_mode, args.attention_heads, args.attention_pool_size, args.seq_len, output_mode=args.output_mode, in_channels=4 if args.occlusion else 3, align=args.align, backbone=args.backbone).to(device)
     occlusion_val = {"eval_coverage": 0.5 * (args.occlusion_coverage_min + args.occlusion_coverage_max)} if args.occlusion else None
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs * len(train_loader)); scaler = GradScaler("cuda", enabled=use_amp)
@@ -163,7 +166,7 @@ def main() -> None:
     resume_path = resolve_resume(args.resume, checkpoint_dir)
     if resume_path:
         saved_config = torch.load(resume_path, map_location="cpu", weights_only=False)["config"]
-        for key in ("epochs", "seq_len", "hidden_dim", "base_channels", "temporal_mode", "image_size", "batch_size", "seed", "data_root", "train_split", "val_split", "split_seed", "attention_heads", "attention_pool_size", "aug_vflip", "val_group", "augment", "output_mode", "loss", "occlusion", "occlusion_coverage_min", "occlusion_coverage_max", "occlusion_scope"):
+        for key in ("epochs", "seq_len", "hidden_dim", "base_channels", "temporal_mode", "image_size", "batch_size", "seed", "data_root", "train_split", "val_split", "split_seed", "attention_heads", "attention_pool_size", "aug_vflip", "val_group", "augment", "output_mode", "loss", "occlusion", "occlusion_coverage_min", "occlusion_coverage_max", "occlusion_scope", "retrieval_index", "align", "backbone"):
             if saved_config.get(key) != getattr(args, key):
                 raise ValueError(f"Resume configuration mismatch for {key}; use the original run configuration")
         checkpoint = torch.load(resume_path, map_location=device, weights_only=False); model.load_state_dict(checkpoint["model"]); optimizer.load_state_dict(checkpoint["optimizer"]); scheduler.load_state_dict(checkpoint["scheduler"]); scaler.load_state_dict(checkpoint.get("scaler", {})); start_epoch, step, best = int(checkpoint["epoch"]) + 1, int(checkpoint["step"]), checkpoint.get("best", best)

@@ -32,14 +32,26 @@ class DualDomainBlock(nn.Module):
         return self.fuse(torch.cat([self.frequency(x), self.spatial(x)], dim=1)) + x
 
 class EENetEncoder(nn.Module):
-    def __init__(self, in_channels: int = 3, base_channels: int = 32) -> None:
+    """blocks_per_stage=1 is the compact encoder; 2 is the fuller EENet-style variant (V11)."""
+    def __init__(self, in_channels: int = 3, base_channels: int = 32, blocks_per_stage: int = 1) -> None:
         super().__init__()
+        stage = lambda c: DualDomainBlock(c) if blocks_per_stage == 1 else nn.Sequential(*[DualDomainBlock(c) for _ in range(blocks_per_stage)])
         self.stem = nn.Conv2d(in_channels, base_channels, 3, padding=1)
-        self.stage1, self.down1 = DualDomainBlock(base_channels), nn.Conv2d(base_channels, base_channels * 2, 3, stride=2, padding=1)
-        self.stage2, self.down2 = DualDomainBlock(base_channels * 2), nn.Conv2d(base_channels * 2, base_channels * 4, 3, stride=2, padding=1)
-        self.stage3, self.out_channels = DualDomainBlock(base_channels * 4), base_channels * 4
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.stage3(self.down2(self.stage2(self.down1(self.stage1(self.stem(x))))))
+        self.stage1, self.down1 = stage(base_channels), nn.Conv2d(base_channels, base_channels * 2, 3, stride=2, padding=1)
+        self.stage2, self.down2 = stage(base_channels * 2), nn.Conv2d(base_channels * 2, base_channels * 4, 3, stride=2, padding=1)
+        self.stage3, self.out_channels = stage(base_channels * 4), base_channels * 4
+    def forward(self, x: torch.Tensor, return_skips: bool = False):
+        s1 = self.stage1(self.stem(x)); s2 = self.stage2(self.down1(s1)); out = self.stage3(self.down2(s2))
+        return (out, s1, s2) if return_skips else out
+
+
+def warp_with_flow(source: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
+    """TRDN's src/warp.py backward warp (sample at x - flow), so V10 aligns exactly as TRDN does."""
+    batch, _, height, width = source.shape
+    yy, xx = torch.meshgrid(torch.arange(height, device=source.device, dtype=source.dtype), torch.arange(width, device=source.device, dtype=source.dtype), indexing="ij")
+    sample = torch.stack([xx, yy], dim=0).unsqueeze(0) - flow.to(source.dtype)
+    grid = torch.stack([2.0 * sample[:, 0] / max(width - 1, 1) - 1.0, 2.0 * sample[:, 1] / max(height - 1, 1) - 1.0], dim=-1)
+    return F.grid_sample(source, grid, mode="bilinear", padding_mode="border", align_corners=True)
 
 class ConvLSTMCell(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int) -> None:
@@ -103,36 +115,84 @@ class VideoEENet(nn.Module):
     encoder, ConvLSTM and decoder, same parameter count) is given only the final frame, so the
     ConvLSTM runs for one step from a zero state and carries no temporal information.
     """
-    def __init__(self, base_channels: int = 32, hidden_dim: int = 64, temporal_mode: str = "convlstm", attention_heads: int = 4, attention_pool_size: int = 8, max_seq_len: int = 10, output_mode: str = "sigmoid_sum", in_channels: int = 3) -> None:
+    def __init__(self, base_channels: int = 32, hidden_dim: int = 64, temporal_mode: str = "convlstm", attention_heads: int = 4, attention_pool_size: int = 8, max_seq_len: int = 10, output_mode: str = "sigmoid_sum", in_channels: int = 3, align: str = "none", backbone: str = "compact") -> None:
         super().__init__()
         if temporal_mode not in TEMPORAL_MODES: raise ValueError(f"temporal_mode must be one of {TEMPORAL_MODES}")
         if output_mode not in OUTPUT_MODES: raise ValueError(f"output_mode must be one of {OUTPUT_MODES}")
         if in_channels not in (3, 4): raise ValueError("in_channels must be 3 (RGB) or 4 (RGB + occlusion mask)")
+        if align not in ("none", "raft"): raise ValueError("align must be 'none' or 'raft'")
+        if backbone not in ("compact", "full"): raise ValueError("backbone must be 'compact' or 'full'")
         self.temporal_mode, self.output_mode, self.in_channels = temporal_mode, output_mode, in_channels
-        self.encoder = EENetEncoder(in_channels=in_channels, base_channels=base_channels)
+        self.align, self.backbone = align, backbone
+        self._raft = []   # V10: frozen RAFT, kept outside the module tree so it is never trained or saved
+        self.encoder = EENetEncoder(in_channels=in_channels, base_channels=base_channels, blocks_per_stage=2 if backbone == "full" else 1)
         if temporal_mode in {"convlstm", "hybrid", "single_frame"}:
             self.temporal = ConvLSTM(base_channels * 4, hidden_dim)
         if temporal_mode in {"spatial_transformer", "hybrid"}:
             self.attention = SpatialTemporalTransformer(base_channels * 4, hidden_dim, attention_heads, attention_pool_size, max_seq_len)
         if temporal_mode == "hybrid":
             self.hybrid_fuse = nn.Conv2d(hidden_dim * 2, hidden_dim, 1)
-        self.decoder = nn.Sequential(nn.Conv2d(hidden_dim + base_channels * 4, base_channels * 4, 3, padding=1), nn.GELU(), nn.ConvTranspose2d(base_channels * 4, base_channels * 2, 4, stride=2, padding=1), nn.GELU(), nn.ConvTranspose2d(base_channels * 2, base_channels, 4, stride=2, padding=1), nn.GELU(), nn.Conv2d(base_channels, 3, 3, padding=1))
+        if backbone == "compact":
+            self.decoder = nn.Sequential(nn.Conv2d(hidden_dim + base_channels * 4, base_channels * 4, 3, padding=1), nn.GELU(), nn.ConvTranspose2d(base_channels * 4, base_channels * 2, 4, stride=2, padding=1), nn.GELU(), nn.ConvTranspose2d(base_channels * 2, base_channels, 4, stride=2, padding=1), nn.GELU(), nn.Conv2d(base_channels, 3, 3, padding=1))
+        else:
+            # V11: U-Net-style decoder with skips from the current frame's full- and half-resolution features.
+            c = base_channels
+            self.dec_bottleneck = nn.Sequential(nn.Conv2d(hidden_dim + c * 4, c * 4, 3, padding=1), nn.GELU(), DualDomainBlock(c * 4))
+            self.dec_up2 = nn.ConvTranspose2d(c * 4, c * 2, 4, stride=2, padding=1)
+            self.dec_fuse2 = nn.Sequential(nn.Conv2d(c * 4, c * 2, 3, padding=1), nn.GELU(), DualDomainBlock(c * 2))
+            self.dec_up1 = nn.ConvTranspose2d(c * 2, c, 4, stride=2, padding=1)
+            self.dec_fuse1 = nn.Sequential(nn.Conv2d(c * 2, c, 3, padding=1), nn.GELU(), DualDomainBlock(c))
+            self.dec_out = nn.Conv2d(c, 3, 3, padding=1)
+    @torch.no_grad()
+    def _aligned(self, frames: torch.Tensor) -> torch.Tensor:
+        """V10: warp every earlier frame onto the current one with frozen RAFT (as TRDN aligns)."""
+        if not self._raft:
+            from torchvision.models.optical_flow import Raft_Small_Weights, raft_small
+            raft = raft_small(weights=Raft_Small_Weights.DEFAULT, progress=False).to(frames.device).eval()
+            for p in raft.parameters(): p.requires_grad_(False)
+            self._raft.append(raft)
+        raft = self._raft[0]
+        batch, steps, _, height, width = frames.shape
+        current = frames[:, -1, :3].float()
+        pad_h, pad_w = (-height) % 8, (-width) % 8
+        cur_in = F.pad(current, (0, pad_w, 0, pad_h), mode="replicate") * 2 - 1
+        out = frames.clone()
+        with torch.autocast(device_type=frames.device.type, enabled=False):
+            for t in range(steps - 1):
+                ref = frames[:, t, :3].float()
+                ref_in = F.pad(ref, (0, pad_w, 0, pad_h), mode="replicate") * 2 - 1
+                flow = raft(ref_in, cur_in)[-1][..., :height, :width]
+                out[:, t] = warp_with_flow(frames[:, t].float(), flow).to(frames.dtype)
+        return out
+
     def forward(self, frames: torch.Tensor) -> torch.Tensor:
         if frames.ndim != 5 or frames.shape[2] != self.in_channels: raise ValueError(f"Expected [B, T, {self.in_channels}, H, W], got {tuple(frames.shape)}")
         if self.temporal_mode == "single_frame":
             frames = frames[:, -1:]
         batch, steps, _, height, width = frames.shape
         if steps < 2 and self.temporal_mode != "single_frame": raise ValueError("VideoEENet requires at least two temporal frames.")
+        if self.align == "raft" and steps > 1:
+            frames = self._aligned(frames)
         pad_h, pad_w = (-height) % 4, (-width) % 4
         padded = F.pad(frames.reshape(-1, self.in_channels, height, width), (0, pad_w, 0, pad_h), mode="replicate")
-        features = self.encoder(padded).reshape(batch, steps, -1, (height + pad_h) // 4, (width + pad_w) // 4)
+        encoded = self.encoder(padded, return_skips=self.backbone == "full")
+        if self.backbone == "full":
+            encoded, skip1, skip2 = encoded
+            skip1 = skip1.reshape(batch, steps, *skip1.shape[1:])[:, -1]; skip2 = skip2.reshape(batch, steps, *skip2.shape[1:])[:, -1]
+        features = encoded.reshape(batch, steps, -1, (height + pad_h) // 4, (width + pad_w) // 4)
         if self.temporal_mode in {"convlstm", "single_frame"}:
             memory = self.temporal(features)
         elif self.temporal_mode == "spatial_transformer":
             memory = self.attention(features)
         else:
             memory = self.hybrid_fuse(torch.cat([self.temporal(features), self.attention(features)], dim=1))
-        residual = self.decoder(torch.cat([memory, features[:, -1]], dim=1))
+        if self.backbone == "full":
+            x = self.dec_bottleneck(torch.cat([memory, features[:, -1]], dim=1))
+            x = self.dec_fuse2(torch.cat([self.dec_up2(x), skip2], dim=1))
+            x = self.dec_fuse1(torch.cat([self.dec_up1(x), skip1], dim=1))
+            residual = self.dec_out(x)
+        else:
+            residual = self.decoder(torch.cat([memory, features[:, -1]], dim=1))
         current = padded.reshape(batch, steps, self.in_channels, height + pad_h, width + pad_w)[:, -1, :3]
         if self.output_mode == "logit_residual":
             current_logit = torch.logit(current.float().clamp(1e-4, 1 - 1e-4))

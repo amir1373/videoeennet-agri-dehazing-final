@@ -1,5 +1,6 @@
 """REVIDE-compatible paired video sequence dataset for VideoEENet."""
 from __future__ import annotations
+import os
 import random
 import re
 import hashlib
@@ -10,6 +11,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import Dataset
+from retrieval import clean_path_for, load_index
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 HAZY_NAMES, CLEAN_NAMES = {"hazy", "input", "inputs", "fog", "degraded"}, {"gt", "clean", "clear", "target", "groundtruth", "ground_truth"}
@@ -89,9 +91,11 @@ def _load_rgb(path: Path, image_size: int, preprocess: str = "resize") -> torch.
 
 class REVIDEVideoDataset(Dataset):
     """Returns `frames` [T, 3, H, W] plus the clean final frame target."""
-    def __init__(self, root: str, split: Optional[str], seq_len: int = 10, image_size: int = 256, random_crop: bool = False, partition: Optional[str] = None, split_seed: int = 1234, augment: bool = False, aug_scale_min: float = 0.6, aug_hflip: float = 0.5, aug_treverse: float = 0.25, aug_gamma: float = 0.3, preprocess: str = "resize", aug_vflip: float = 0.0, val_group: str = "sequence") -> None:
+    def __init__(self, root: str, split: Optional[str], seq_len: int = 10, image_size: int = 256, random_crop: bool = False, partition: Optional[str] = None, split_seed: int = 1234, augment: bool = False, aug_scale_min: float = 0.6, aug_hflip: float = 0.5, aug_treverse: float = 0.25, aug_gamma: float = 0.3, preprocess: str = "resize", aug_vflip: float = 0.0, val_group: str = "sequence", retrieval_index: Optional[str] = None) -> None:
         self.root, self.split, self.seq_len, self.image_size, self.random_crop = Path(root), split, seq_len, image_size, random_crop
         self.preprocess = preprocess
+        # R1: retrieved references (scripts/retrieval.py) instead of the nine preceding frames.
+        self.retrieval = load_index(retrieval_index) if retrieval_index else None
         # Augmentation for scene generalisation. Val/test construct with augment=False.
         self.augment, self.aug_scale_min = augment, aug_scale_min
         self.aug_hflip, self.aug_treverse, self.aug_gamma = aug_hflip, aug_treverse, aug_gamma
@@ -121,6 +125,10 @@ class REVIDEVideoDataset(Dataset):
     def __getitem__(self, index: int) -> Dict[str, object]:
         sequence_index, end_index = self.index[index]; sequence = self.sequences[sequence_index]; pairs: Sequence[Tuple[Path, Path]] = sequence["pairs"]
         clip = pairs[end_index - self.seq_len + 1 : end_index + 1]
+        if self.retrieval is not None:
+            refs = self.retrieval.get(os.path.realpath(str(clip[-1][0])))
+            if refs is not None and len(refs) == self.seq_len - 1:
+                clip = [(Path(r), Path(clean_path_for(r))) for r in refs] + [clip[-1]]
         if self.preprocess == "crop":
             # one origin for the whole clip; random while training, centre otherwise
             _CROP_ORIGIN["random"] = bool(self.augment or self.random_crop)

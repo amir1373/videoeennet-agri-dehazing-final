@@ -47,7 +47,12 @@ model = VideoEENet(cfg.get("base_channels", 32), cfg.get("hidden_dim", 64),
                    cfg.get("temporal_mode", "convlstm"), cfg.get("attention_heads", 4),
                    cfg.get("attention_pool_size", 8), cfg.get("seq_len", SEQ_LEN),
                    output_mode=cfg.get("output_mode", "sigmoid_sum"),
-                   in_channels=4 if cfg.get("occlusion") else 3).to(dev)
+                   in_channels=4 if cfg.get("occlusion") else 3,
+                   align=cfg.get("align", "none"), backbone=cfg.get("backbone", "compact")).to(dev)
+# R1: RETRIEVAL_INDEX=/path.json evaluates with retrieved references (defaults to the one the
+# model was trained with).
+RETRIEVAL = os.environ.get("RETRIEVAL_INDEX", "") or cfg.get("retrieval_index", "") or ""
+retrieval_map = json.load(open(RETRIEVAL)) if RETRIEVAL else None
 dropped = load_model_state(model, ck["model"])
 if dropped:
     print(f"dropped {len(dropped)} unused legacy tensors (attention/hybrid_fuse)", flush=True)
@@ -107,6 +112,10 @@ for scene, dirs in sorted(scene_dirs.items()):
         gt_all   = torch.stack([load_frame(os.path.join(gd, f)) for f in files])
         for end in range(SEQ_LEN - 1, len(files)):
             hz = hazy_all[end - SEQ_LEN + 1:end + 1].unsqueeze(0).to(dev)
+            if retrieval_map is not None:
+                refs = retrieval_map.get(os.path.realpath(os.path.join(hd, files[end])))
+                if refs is not None and len(refs) == SEQ_LEN - 1:
+                    hz = torch.cat([torch.stack([load_frame(r) for r in refs]), hazy_all[end:end + 1]]).unsqueeze(0).to(dev)
             tgt = gt_all[end].unsqueeze(0).to(dev)
             mask = None
             if OCC_COVERAGE is not None:
@@ -162,6 +171,7 @@ json.dump({"per_clip": per_clip, "aggregate": agg, "preprocess_mode": MODE,
            "ssim_definition": "scikit-image SSIM on uint8, as TRDN; ssim_msssim = pytorch_msssim",
            "epoch": ck.get("epoch"), "step": ck.get("step"), "config": cfg,
            "checkpoint": CKPT, "crop_size": SIZE, "seq_len": SEQ_LEN,
+           "retrieval_index": RETRIEVAL or None,
            "occlusion_coverage_requested": OCC_COVERAGE, "occlusion_scope": OCC_SCOPE if OCC_COVERAGE is not None else None,
            "note": "MODE=crop reproduces TRDN's center-crop-256-at-native-resolution protocol."},
           open(OUT, "w"), indent=2)
