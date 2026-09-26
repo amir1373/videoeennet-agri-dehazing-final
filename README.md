@@ -1,9 +1,9 @@
 # VideoEENet: Temporal Video Dehazing
 
-For GPU training, SSH/tmux, validated Train/validation/Test separation, and automatic
-post-training figures, follow [RUNPOD.md](RUNPOD.md) and
-[the RunPod notebook](notebooks/VideoEENet_RunPod.ipynb). Use `--val-split auto`
-and `--require-cuda --report-after-training` for the complete workflow.
+Developed by Amir Moshtaghioun (University of Regina) for the MASc thesis *Temporal modelling for
+real-world video dehazing: A protocol-matched evaluation of recurrent regression and latent
+diffusion*. Training can be run from the scripts below or from
+[the notebook](notebooks/VideoEENet_RunPod.ipynb) on a GPU server ([RUNPOD.md](RUNPOD.md)).
 
 VideoEENet dehazes the current video frame using a chronological window of the current frame plus its previous nine hazy frames. Its per-frame encoder is a simplified version of EENet's frequency/spatial dual-domain design, taken from the author's own EENet implementation ([amir1373/EENet-Dehazing](https://github.com/amir1373/EENet-Dehazing)), and it adds ConvLSTM temporal memory before reconstruction.
 
@@ -13,7 +13,7 @@ VideoEENet dehazes the current video frame using a chronological window of the c
 
 The model input is `[B, T, 3, H, W]`, with `T=10` by default. The output is the clean reconstruction of the final frame, `[B, 3, H, W]`. The model is fully convolutional and pads dimensions internally to multiples of four during inference.
 
-## RunPod Setup
+## Setup
 
 ```bash
 git clone https://github.com/amir1373/videoeennet-agri-dehazing-final.git
@@ -71,11 +71,11 @@ Single runs are not sufficient for a model ranking. Run each temporal mode with 
 python scripts/run_multiseed.py --data-root /workspace/REVIDE_sequences --output-dir /workspace/videoeennet_runs/ablations --temporal-mode hybrid --seeds 7 19 31 --epochs 30 --seq-len 5 --hidden-dim 64
 ```
 
-Repeat for `convlstm` and `spatial_transformer`. Repeat the protocol for `--seq-len 3`, `5`, and `7` before making sequence-length claims. The code reports results; it does not make unearned performance claims.
+Repeat for `convlstm` and `spatial_transformer`. Repeat the protocol for `--seq-len 3`, `5`, and `7` before making sequence-length claims.
 
-## RunPod Notebook
+## Notebook
 
-Open [notebooks/VideoEENet_RunPod.ipynb](notebooks/VideoEENet_RunPod.ipynb) in Jupyter on RunPod. It imports repository modules, provides data/sequence/debug visualizations, launches resumable training, evaluates a checkpoint, runs inference, and starts the controlled multi-seed protocol without duplicating model code.
+Open [notebooks/VideoEENet_RunPod.ipynb](notebooks/VideoEENet_RunPod.ipynb) in Jupyter on a GPU server. It imports repository modules, provides data/sequence/debug visualizations, launches resumable training, evaluates a checkpoint, runs inference, and starts the controlled multi-seed protocol without duplicating model code.
 
 ## Inference
 
@@ -95,15 +95,12 @@ Expected output includes `frames: (1, 10, 3, 64, 64)` and `prediction: (1, 3, 64
 
 ## Notes
 
-### Verification Limits
-
-The multi-seed summaries currently describe best validation scores, not held-out test performance. Do not use them as final paper test results. Use a separate validation split for checkpoint selection and reserve Test for final evaluation; the example `--val-split Test` is exploratory only. Missing split folders and mismatched frame names now raise errors instead of silently falling back. Resume requires the original training configuration, including the epoch budget, and restarts at the last completed epoch. Epoch checkpoints do not recover unfinished-epoch progress. SSIM requires `pytorch-msssim`; the former global-statistics fallback has been removed, so old fallback scores are not comparable.
-
-Equal hidden dimensions control recurrent width, not total model parameter count. The transformer/hybrid comparisons still require actual multi-seed experiments and reporting of parameter counts before scientific conclusions. Local CPU tests do not establish CUDA memory requirements or quality on REVIDE.
+Reported results use the matched crop protocol and final checkpoints of a fixed schedule, with
+every setting trained at two or three seeds (see the thesis, Chapter 3). Equal hidden dimensions
+control recurrent width, not total parameter count.
 
 - This is a supervised temporal dehazing model, not a diffusion model.
 - Validation is against the clean final frame in each REVIDE window.
-- No training results are claimed until you run this pipeline on your data.
 
 ## References
 
@@ -115,12 +112,21 @@ VideoEENet builds on:
 
 ## Citation
 
-Citation placeholder: add the final paper citation once the manuscript is ready.
+If you use this code, please cite the thesis and the REVIDE dataset:
+
+```bibtex
+@mastersthesis{moshtaghioun2026temporal,
+  title  = {Temporal modelling for real-world video dehazing: A protocol-matched evaluation of recurrent regression and latent diffusion},
+  author = {Moshtaghioun, Amir},
+  school = {University of Regina},
+  year   = {2026}
+}
+```
 
 ## Matched-protocol options (branch `retrain-2026-09`)
 
-- The model now builds only the modules its `--temporal-mode` uses: the default `convlstm` model
-  has 1,805,443 parameters, all trained. `load_model_state()` still reads older checkpoints.
+- The model builds only the modules its `--temporal-mode` uses: the default `convlstm` model
+  has 1,805,443 parameters, all trained. `load_model_state()` also reads checkpoints that contain every temporal module.
 - `--temporal-mode single_frame`: the identical network given only the final frame of each window
   (no temporal information), for testing whether temporal information helps.
 - `--aug-vflip P`: vertical flip with probability P (default 0).
@@ -129,10 +135,10 @@ Citation placeholder: add the final paper citation once the manuscript is ready.
 - `scripts/analysis/matched_eval.py` scores under the crop protocol with TRDN's exact metrics
   (scikit-image SSIM on uint8, LPIPS-Alex) and records per-window PSNR.
 
-## Further options (2026-09-25/26)
+## Further options
 
 All default to off; with none set, the model and training are unchanged (a seed-1234 reproduction
-matches the earlier reference exactly).
+matches the reference model exactly).
 
 | option (`scripts/train.py`) | effect |
 |---|---|
@@ -141,8 +147,6 @@ matches the earlier reference exactly).
 | `--align raft` | warp earlier frames onto the current one with frozen RAFT-small before encoding |
 | `--backbone full` | two dual-domain blocks per encoder stage and a U-Net decoder with current-frame skips (3.66 M parameters) |
 | `--retrieval-index FILE` | references retrieved from up to 30 earlier frames (`scripts/retrieval.py`) |
-| `--occlusion`, `--occlusion-coverage-min/max`, `--occlusion-scope` | train on opaque occluders with a mask input channel (`scripts/occlusion.py`) |
 
-`scripts/analysis/matched_eval.py` takes an optional coverage and scope (`… crop 0.35 lens`), reads
-`RETRIEVAL_INDEX` and writes every prediction to `SAVE_PREDICTIONS=file.npz`; per-window SSIM and
-LPIPS are now recorded.
+`scripts/analysis/matched_eval.py` reads `RETRIEVAL_INDEX` and writes every prediction to
+`SAVE_PREDICTIONS=file.npz`; per-window SSIM and LPIPS are recorded.
