@@ -31,6 +31,10 @@ MODE = sys.argv[3] if len(sys.argv) > 3 else "crop"     # "crop" (TRDN protocol)
 # argv[4] = coverage (e.g. 0.35), argv[5] = scope ("lens": every frame, "current": final frame).
 OCC_COVERAGE = float(sys.argv[4]) if len(sys.argv) > 4 else None
 OCC_SCOPE = sys.argv[5] if len(sys.argv) > 5 else "lens"
+# Optional: SAVE_PREDICTIONS=/path.npz keeps every prediction (uint8 HWC) keyed by the resolved
+# target-frame path (same keys as TRDN's evaluate_full_test.py --save-predictions).
+SAVE_PREDICTIONS = os.environ.get("SAVE_PREDICTIONS", "")
+saved_predictions = {}
 ROOT = os.environ.get("REVIDE_SEQUENCES", "/workspace/datasets/REVIDE_sequences")
 SEQ_LEN = 10
 SIZE = 256
@@ -116,6 +120,9 @@ for scene, dirs in sorted(scene_dirs.items()):
                 hz = (torch.cat([window, channel], dim=1) if model.in_channels == 4 else window).unsqueeze(0)
             with torch.no_grad():
                 pred = model(hz).clamp(0, 1)
+            if SAVE_PREDICTIONS:
+                key = occluder_key(os.path.join(hd, files[end])).replace("/", "|")
+                saved_predictions[key] = (pred[0].detach().float().mul(255).round().byte().permute(1, 2, 0).cpu().numpy())
             if mask is not None:
                 covs.append(float(mask.mean()))
                 for region, sink in ((mask, ps_occ), (1 - mask, ps_vis)):
@@ -140,6 +147,9 @@ for scene, dirs in sorted(scene_dirs.items()):
         print(f"  {scene:<8} psnr {np.mean(ps):7.4f}  ssim {np.mean(ss):.4f}  lpips {np.mean(lp):.4f}  "
               f"windows {len(ps):3d}  frames {nf}", flush=True)
 
+if SAVE_PREDICTIONS:
+    os.makedirs(os.path.dirname(os.path.abspath(SAVE_PREDICTIONS)), exist_ok=True)
+    np.savez_compressed(SAVE_PREDICTIONS, **saved_predictions)
 tot = sum(c["num_frames"] for c in per_clip) or 1
 agg = {"psnr": {"mean": sum(c["psnr_mean"] * c["num_frames"] for c in per_clip) / tot},
        "ssim": {"mean": sum(c["ssim_mean"] * c["num_frames"] for c in per_clip) / tot},
