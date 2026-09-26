@@ -128,3 +128,21 @@ Citation placeholder: add the final paper citation once the manuscript is ready.
   training videos.
 - `scripts/analysis/matched_eval.py` scores under the crop protocol with TRDN's exact metrics
   (scikit-image SSIM on uint8, LPIPS-Alex) and records per-window PSNR.
+
+## Further options (2026-09-25/26)
+
+All default to off; with none set, the model and training are unchanged (a seed-1234 reproduction
+matches the earlier reference exactly).
+
+| option (`scripts/train.py`) | effect |
+|---|---|
+| `--output-mode logit_residual` | output `sigmoid(logit(current) + residual)`, which returns the input for a zero residual |
+| `--loss mse_l1` | MSE + 0.1 × L1 instead of L1 |
+| `--align raft` | warp earlier frames onto the current one with frozen RAFT-small before encoding |
+| `--backbone full` | two dual-domain blocks per encoder stage and a U-Net decoder with current-frame skips (3.66 M parameters) |
+| `--retrieval-index FILE` | references retrieved from up to 30 earlier frames (`scripts/retrieval.py`) |
+| `--occlusion`, `--occlusion-coverage-min/max`, `--occlusion-scope` | train on opaque occluders with a mask input channel (`scripts/occlusion.py`) |
+
+`scripts/analysis/matched_eval.py` takes an optional coverage and scope (`… crop 0.35 lens`), reads
+`RETRIEVAL_INDEX` and writes every prediction to `SAVE_PREDICTIONS=file.npz`; per-window SSIM and
+LPIPS are now recorded.
