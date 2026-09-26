@@ -127,6 +127,9 @@ for scene, dirs in sorted(scene_dirs.items()):
                     window[-1] = apply_occluder(window[-1], mask); channel[-1] = mask
                 # A model trained without occlusion has no mask channel: it sees only the grey fill.
                 hz = (torch.cat([window, channel], dim=1) if model.in_channels == 4 else window).unsqueeze(0)
+            if mask is None and model.in_channels == 4:
+                # An occlusion-trained model on clean frames: nothing is hidden, so the mask channel is zero.
+                hz = torch.cat([hz, torch.zeros_like(hz[:, :, :1])], dim=2)
             with torch.no_grad():
                 pred = model(hz).clamp(0, 1)
             if SAVE_PREDICTIONS:
